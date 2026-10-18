@@ -1,30 +1,91 @@
 name: Build APK
+
 on:
-  workflow_dispatch:
   push:
-    branches: [main]
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Unzip project
-        run: unzip -q rifaq-school-app.zip -d src
+
+      # يبحث عن مجلد المشروع؛ وإن لم يجده يفكّ أي ملف zip موجود في المستودع (GitHub لا يفكّ الـ zip بنفسه).
+      - name: Locate project
+        run: |
+          find_settings() { find . -maxdepth 4 -name settings.gradle.kts -not -path './.git/*' | head -n 1; }
+          settings=$(find_settings)
+          if [ -z "$settings" ]; then
+            zipfile=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' | head -n 1)
+            if [ -n "$zipfile" ]; then
+              echo "فك الملف: $zipfile"
+              mkdir -p extracted
+              unzip -q -o "$zipfile" -d extracted
+              settings=$(find_settings)
+            fi
+          fi
+          if [ -z "$settings" ]; then
+            echo "::error::settings.gradle.kts غير موجود. هذه محتويات المستودع:"
+            find . -maxdepth 3 -not -path './.git/*' | head -n 60
+            exit 1
+          fi
+          dir=$(dirname "$settings")
+          echo "مجلد المشروع: $dir"
+          echo "PROJECT_DIR=$dir" >> "$GITHUB_ENV"
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.10.2
+          build-root-directory: ${{ env.PROJECT_DIR }}
+
+      # يستعمل السر GOOGLE_SERVICES_JSON إن وُجد، وإلا الملف الموجود في المستودع (في أي مكان).
+      - name: Prepare google-services.json
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          GS_JSON: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GS_JSON" ]; then
+            printf '%s' "$GS_JSON" > app/google-services.json
+          fi
+          if [ ! -f app/google-services.json ]; then
+            found=$(find "$GITHUB_WORKSPACE" -name google-services.json -not -path '*/build/*' -not -path '*/.git/*' | head -n 1)
+            if [ -n "$found" ]; then
+              echo "وُجد الملف في: $found"
+              cp "$found" app/google-services.json
+            fi
+          fi
+          test -f app/google-services.json || { echo "::error::google-services.json مفقود. ضعه في app/google-services.json أو أنشئ السر GOOGLE_SERVICES_JSON"; exit 1; }
+          grep -q '"package_name": "com.rifaq.school"' app/google-services.json || { echo "::error::package_name في google-services.json لا يطابق com.rifaq.school"; exit 1; }
+
       - name: Build debug APK
-        working-directory: src/app
-        run: gradle assembleDebug --stacktrace
-      - name: Unit tests
-        working-directory: src/app
-        continue-on-error: true
-        run: gradle test
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle :app:assembleDebug --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
           name: rifaq-school-debug-apk
-          path: src/app/app/build/outputs/apk/debug/*.apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      # الاختبارات بعد رفع الـ APK، حتى لا يمنع اختبار فاشل تنزيل التطبيق.
+      - name: Unit tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle testDebugUnitTest --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-reports
+          path: |
+            ${{ env.PROJECT_DIR }}/**/build/reports/**
+          if-no-files-found: ignore
